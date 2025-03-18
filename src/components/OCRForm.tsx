@@ -3,6 +3,10 @@
 import { useState, useRef } from 'react';
 import { createWorker } from 'tesseract.js';
 import { Button } from '@/components/ui/button';
+import * as pdfjsLib from 'pdfjs-dist';
+
+// PDFワーカーの設定
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 interface OCRResult {
   text: string;
@@ -22,18 +26,55 @@ export function OCRForm() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [ocrResult, setOcrResult] = useState<OCRResult | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const convertPDFToImage = async (file: File): Promise<File> => {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+    setTotalPages(pdf.numPages);
+    
+    const page = await pdf.getPage(currentPage);
+    const viewport = page.getViewport({ scale: 2.0 }); // スケールを2.0に設定して高品質化
+
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Canvas context is null');
+
+    await page.render({
+      canvasContext: context,
+      viewport: viewport
+    }).promise;
+
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => {
+        if (!blob) throw new Error('Failed to convert PDF to image');
+        const imageFile = new File([blob], 'converted-pdf-page.png', { type: 'image/png' });
+        resolve(imageFile);
+      }, 'image/png');
+    });
+  };
 
   const processImage = async (file: File) => {
     setIsProcessing(true);
     try {
+      const imageFile = file.type === 'application/pdf' 
+        ? await convertPDFToImage(file)
+        : file;
+
       // Create image preview
       const reader = new FileReader();
       reader.onloadend = () => {
         setImagePreview(reader.result as string);
       };
-      reader.readAsDataURL(file);
+      reader.readAsDataURL(imageFile);
 
       // Initialize Tesseract worker
       const worker = await createWorker();
@@ -41,7 +82,7 @@ export function OCRForm() {
       await worker.initialize('jpn');
       
       // Perform OCR
-      const { data } = await worker.recognize(file);
+      const { data } = await worker.recognize(imageFile);
       
       // Extract lines with their bounding boxes
       const lines = data.lines || [];
@@ -64,6 +105,7 @@ export function OCRForm() {
       await worker.terminate();
     } catch (error) {
       console.error('OCR処理中にエラーが発生しました:', error);
+      alert(error instanceof Error ? error.message : 'OCR処理中にエラーが発生しました。');
     } finally {
       setIsProcessing(false);
     }
@@ -88,11 +130,22 @@ export function OCRForm() {
     }
   };
 
-  const copyText = async (text: string) => {
+  const copyText = async (text: string, index?: number) => {
     try {
       await navigator.clipboard.writeText(text);
+      if (typeof index === 'number') {
+        setCopiedIndex(index);
+        setTimeout(() => setCopiedIndex(null), 2000);
+      }
     } catch (err) {
       console.error('テキストのコピーに失敗しました:', err);
+    }
+  };
+
+  const handlePageChange = async (newPage: number) => {
+    if (fileInputRef.current?.files?.[0] && newPage >= 1 && newPage <= totalPages) {
+      setCurrentPage(newPage);
+      await processImage(fileInputRef.current.files[0]);
     }
   };
 
@@ -109,19 +162,19 @@ export function OCRForm() {
           type="file"
           ref={fileInputRef}
           onChange={handleFileChange}
-          accept="image/*"
+          accept="image/*,.pdf"
           className="hidden"
         />
         <div className="space-y-4">
           <div className="text-lg text-gray-600">
-            ここに画像をドラッグ＆ドロップ
+            ここに画像またはPDFをドラッグ＆ドロップ
             <br />
             または
             <br />
-            クリックして画像を選択
+            クリックして選択
           </div>
           <div className="text-sm text-gray-500">
-            対応フォーマット: PNG, JPEG, GIF
+            対応フォーマット: PNG, JPEG, GIF, PDF
           </div>
         </div>
       </div>
@@ -138,13 +191,39 @@ export function OCRForm() {
         <div className="bg-white p-4 rounded-lg shadow-sm">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold">OCR結果</h3>
-            <Button
-              onClick={() => copyText(ocrResult.text)}
-              variant="outline"
-              size="sm"
-            >
-              全てコピー
-            </Button>
+            <div className="flex items-center space-x-4">
+              {totalPages > 1 && (
+                <div className="flex items-center space-x-2">
+                  <Button
+                    onClick={() => handlePageChange(currentPage - 1)}
+                    disabled={currentPage <= 1}
+                    variant="outline"
+                    size="sm"
+                  >
+                    前のページ
+                  </Button>
+                  <span className="text-sm text-gray-600">
+                    {currentPage} / {totalPages}
+                  </span>
+                  <Button
+                    onClick={() => handlePageChange(currentPage + 1)}
+                    disabled={currentPage >= totalPages}
+                    variant="outline"
+                    size="sm"
+                  >
+                    次のページ
+                  </Button>
+                </div>
+              )}
+              <Button
+                onClick={() => copyText(ocrResult.text)}
+                variant="outline"
+                size="sm"
+                className="min-w-[100px]"
+              >
+                全てコピー
+              </Button>
+            </div>
           </div>
           <div className="space-y-4">
             {ocrResult.lines.map((line, index) => (
@@ -176,12 +255,12 @@ export function OCRForm() {
                   <div className="flex-1 flex items-center justify-between min-h-[2rem]">
                     <span className="text-sm whitespace-pre-wrap">{line.text}</span>
                     <Button
-                      onClick={() => copyText(line.text)}
-                      variant="ghost"
+                      onClick={() => copyText(line.text, index)}
+                      variant={copiedIndex === index ? "secondary" : "ghost"}
                       size="sm"
-                      className="opacity-0 group-hover:opacity-100 transition-opacity"
+                      className="min-w-[80px] transition-all duration-200"
                     >
-                      コピー
+                      {copiedIndex === index ? "コピー完了!" : "コピー"}
                     </Button>
                   </div>
                 </div>
@@ -195,4 +274,4 @@ export function OCRForm() {
       )}
     </div>
   );
-} 
+}
