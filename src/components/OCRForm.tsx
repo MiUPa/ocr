@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef } from 'react';
-import { createWorker } from 'tesseract.js';
+import { createWorker, PSM } from 'tesseract.js';
 import { Button } from '@/components/ui/button';
 import * as pdfjsLib from 'pdfjs-dist';
 
@@ -29,9 +29,9 @@ export function OCRForm() {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [isHandwrittenMode, setIsHandwrittenMode] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const convertPDFToImage = async (file: File): Promise<File> => {
     const arrayBuffer = await file.arrayBuffer();
@@ -39,7 +39,7 @@ export function OCRForm() {
     setTotalPages(pdf.numPages);
     
     const page = await pdf.getPage(currentPage);
-    const viewport = page.getViewport({ scale: 2.0 }); // スケールを2.0に設定して高品質化
+    const viewport = page.getViewport({ scale: 2.0 });
 
     const canvas = document.createElement('canvas');
     canvas.width = viewport.width;
@@ -76,10 +76,16 @@ export function OCRForm() {
       };
       reader.readAsDataURL(imageFile);
 
-      // Initialize Tesseract worker
+      // Initialize Tesseract worker with optimized settings
       const worker = await createWorker();
       await worker.loadLanguage('jpn');
       await worker.initialize('jpn');
+
+      // Configure Tesseract for better handwriting recognition
+      await worker.setParameters({
+        tessedit_pageseg_mode: isHandwrittenMode ? PSM.SPARSE_TEXT : PSM.AUTO, // SPARSE_TEXT: 手書き文字向け, AUTO: 印刷文字向け
+        preserve_interword_spaces: '1'
+      });
       
       // Perform OCR
       const { data } = await worker.recognize(imageFile);
@@ -179,6 +185,18 @@ export function OCRForm() {
         </div>
       </div>
 
+      {/* 認識モード切り替え */}
+      <div className="flex items-center justify-end space-x-2">
+        <span className="text-sm text-gray-600">認識モード:</span>
+        <Button
+          onClick={() => setIsHandwrittenMode(!isHandwrittenMode)}
+          variant={isHandwrittenMode ? "secondary" : "outline"}
+          size="sm"
+        >
+          {isHandwrittenMode ? "手書き文字" : "印刷文字"}
+        </Button>
+      </div>
+
       {/* OCR結果表示 */}
       {isProcessing ? (
         <div className="bg-white p-4 rounded-lg shadow-sm flex items-center justify-center min-h-[200px]">
@@ -188,10 +206,11 @@ export function OCRForm() {
           </div>
         </div>
       ) : ocrResult && imagePreview && (
-        <div className="bg-white p-4 rounded-lg shadow-sm">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold">OCR結果</h3>
-            <div className="flex items-center space-x-4">
+        <div className="grid grid-cols-2 gap-6">
+          {/* 元の画像表示 */}
+          <div className="bg-white p-4 rounded-lg shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold">元の画像</h3>
               {totalPages > 1 && (
                 <div className="flex items-center space-x-2">
                   <Button
@@ -215,6 +234,21 @@ export function OCRForm() {
                   </Button>
                 </div>
               )}
+            </div>
+            <div className="relative w-full aspect-auto">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={imagePreview}
+                alt="Original document"
+                className="w-full h-auto"
+              />
+            </div>
+          </div>
+
+          {/* OCR結果表示 */}
+          <div className="bg-white p-4 rounded-lg shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold">OCR結果</h3>
               <Button
                 onClick={() => copyText(ocrResult.text)}
                 variant="outline"
@@ -224,52 +258,52 @@ export function OCRForm() {
                 全てコピー
               </Button>
             </div>
-          </div>
-          <div className="space-y-4">
-            {ocrResult.lines.map((line, index) => (
-              line.text.trim() && (
-                <div
-                  key={index}
-                  className="flex items-start space-x-4 p-2 hover:bg-gray-50 rounded-lg group"
-                >
-                  {/* 切り抜き画像表示エリア */}
-                  <div className="w-1/3 relative">
-                    <div className="aspect-[4/1] relative overflow-hidden">
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        ref={imageRef}
-                        src={imagePreview}
-                        alt={`Line ${index + 1}`}
-                        className="absolute"
-                        style={{
-                          clipPath: `polygon(${line.bbox.x0}px ${line.bbox.y0}px, ${line.bbox.x1}px ${line.bbox.y0}px, ${line.bbox.x1}px ${line.bbox.y1}px, ${line.bbox.x0}px ${line.bbox.y1}px)`,
-                          top: `-${line.bbox.y0}px`,
-                          left: `-${line.bbox.x0}px`,
-                          width: '100%',
-                          height: 'auto'
-                        }}
-                      />
+            <div className="space-y-4 max-h-[600px] overflow-y-auto">
+              {ocrResult.lines.map((line, index) => (
+                line.text.trim() && (
+                  <div
+                    key={index}
+                    className="flex items-start space-x-4 p-2 hover:bg-gray-50 rounded-lg group"
+                  >
+                    {/* 切り抜き画像表示エリア */}
+                    <div className="w-1/3 relative">
+                      <div className="aspect-[4/1] relative overflow-hidden">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          ref={imageRef}
+                          src={imagePreview}
+                          alt={`Line ${index + 1}`}
+                          className="absolute"
+                          style={{
+                            clipPath: `polygon(${line.bbox.x0}px ${line.bbox.y0}px, ${line.bbox.x1}px ${line.bbox.y0}px, ${line.bbox.x1}px ${line.bbox.y1}px, ${line.bbox.x0}px ${line.bbox.y1}px)`,
+                            top: `-${line.bbox.y0}px`,
+                            left: `-${line.bbox.x0}px`,
+                            width: '100%',
+                            height: 'auto'
+                          }}
+                        />
+                      </div>
+                    </div>
+                    {/* テキストとコピーボタン */}
+                    <div className="flex-1 flex items-center justify-between min-h-[2rem]">
+                      <span className="text-sm whitespace-pre-wrap">{line.text}</span>
+                      <Button
+                        onClick={() => copyText(line.text, index)}
+                        variant={copiedIndex === index ? "secondary" : "ghost"}
+                        size="sm"
+                        className="min-w-[80px] transition-all duration-200"
+                      >
+                        {copiedIndex === index ? "コピー完了!" : "コピー"}
+                      </Button>
                     </div>
                   </div>
-                  {/* テキストとコピーボタン */}
-                  <div className="flex-1 flex items-center justify-between min-h-[2rem]">
-                    <span className="text-sm whitespace-pre-wrap">{line.text}</span>
-                    <Button
-                      onClick={() => copyText(line.text, index)}
-                      variant={copiedIndex === index ? "secondary" : "ghost"}
-                      size="sm"
-                      className="min-w-[80px] transition-all duration-200"
-                    >
-                      {copiedIndex === index ? "コピー完了!" : "コピー"}
-                    </Button>
-                  </div>
-                </div>
-              )
-            ))}
+                )
+              ))}
+            </div>
+            <p className="mt-4 text-sm text-gray-600">
+              認識精度: {ocrResult.confidence.toFixed(2)}%
+            </p>
           </div>
-          <p className="mt-4 text-sm text-gray-600">
-            認識精度: {ocrResult.confidence.toFixed(2)}%
-          </p>
         </div>
       )}
     </div>
