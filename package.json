@@ -10,9 +10,13 @@
   },
   "dependencies": {
     "@hookform/resolvers": "^4.1.3",
+    "@paddlejs-models/ocr": "^1.2.4",
+    "@paddlejs/paddlejs-core": "^2.2.0",
     "@radix-ui/react-label": "^2.1.2",
     "@radix-ui/react-slot": "^1.1.2",
     "@radix-ui/react-toast": "^1.2.6",
+    "@tensorflow-models/coco-ssd": "^2.2.3",
+    "@tensorflow/tfjs": "^4.22.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.482.0",
