@@ -1,4 +1,4 @@
-import { OCRForm } from '@/components/OCRForm';
+import { OCRForm } from '../components/OCRForm';
 
 export default function Home() {
   return (

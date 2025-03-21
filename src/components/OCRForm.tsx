@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { createWorker, PSM, OEM } from 'tesseract.js';
-import { Button } from '@/components/ui/button';
+import { Button } from '../components/ui/button';
 import * as pdfjsLib from 'pdfjs-dist';
+import * as tf from '@tensorflow/tfjs';
 
 // PDFワーカーの設定
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
@@ -34,6 +35,19 @@ interface OCRElement {
   };
 }
 
+// 学習データの型定義
+interface TrainingData {
+  imageSrc: string;
+  originalText: string;
+  correctedText: string;
+  bbox: {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  };
+}
+
 export function OCRForm() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [ocrResult, setOcrResult] = useState<OCRResult | null>(null);
@@ -43,10 +57,223 @@ export function OCRForm() {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [isHandwrittenMode, setIsHandwrittenMode] = useState(true);
+  const [trainingData, setTrainingData] = useState<TrainingData[]>([]);
+  const [isTraining, setIsTraining] = useState(false);
+  const [trainProgress, setTrainProgress] = useState(0);
+  const [isEditing, setIsEditing] = useState<Record<number, boolean>>({});
+  const [editedText, setEditedText] = useState<Record<number, string>>({});
+  const [model, setModel] = useState<tf.LayersModel | null>(null);
+  const [modelLoaded, setModelLoaded] = useState(false);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const originalImageRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // TensorFlowモデルの作成と学習のための関数
+  useEffect(() => {
+    // localStorageから保存されていた学習データを読み込む
+    const savedTrainingData = localStorage.getItem('ocrTrainingData');
+    if (savedTrainingData) {
+      setTrainingData(JSON.parse(savedTrainingData));
+    }
+
+    // モデルをロードする（存在する場合）
+    const loadSavedModel = async () => {
+      try {
+        const savedModel = await tf.loadLayersModel('indexeddb://ocr-correction-model');
+        setModel(savedModel);
+        setModelLoaded(true);
+        console.log('保存されたモデルをロードしました');
+      } catch (loadError) {
+        console.log('保存されたモデルはありません。新しいモデルを作成します。');
+        createNewModel();
+      }
+    };
+
+    // 新しいモデルを作成
+    const createNewModel = () => {
+      const newModel = tf.sequential();
+      
+      // 文字エンベディングのための入力層
+      newModel.add(tf.layers.embedding({
+        inputDim: 10000, // 語彙サイズ
+        outputDim: 64,
+        inputLength: 20 // 入力テキストの最大長
+      }));
+      
+      // LSTM層
+      newModel.add(tf.layers.lstm({
+        units: 64,
+        returnSequences: true
+      }));
+      
+      // 双方向LSTM層
+      newModel.add(tf.layers.bidirectional({
+        layer: tf.layers.lstm({ units: 32 }),
+        mergeMode: 'concat'
+      }));
+      
+      // 出力層
+      newModel.add(tf.layers.dense({
+        units: 10000, // 語彙サイズと同じ
+        activation: 'softmax'
+      }));
+      
+      // モデルをコンパイル
+      newModel.compile({
+        optimizer: 'adam',
+        loss: 'categoricalCrossentropy',
+        metrics: ['accuracy']
+      });
+      
+      setModel(newModel);
+      setModelLoaded(true);
+      console.log('新しいモデルを作成しました');
+    };
+
+    loadSavedModel();
+  }, []);
+
+  // テキストをトークン化する関数
+  const tokenizeText = (text: string, maxLength: number = 20): number[] => {
+    // 非常に単純なトークン化（文字単位）
+    const tokens = Array.from(text).map(char => char.charCodeAt(0) % 10000);
+    
+    // パディング
+    while (tokens.length < maxLength) {
+      tokens.push(0);
+    }
+    
+    // 切り詰め
+    return tokens.slice(0, maxLength);
+  };
+
+  // トークンをテキストに戻す関数
+  const detokenizeText = (tokens: number[]): string => {
+    return tokens
+      .filter(token => token > 0)
+      .map(token => String.fromCharCode(token))
+      .join('');
+  };
+
+  // 学習データの準備
+  const prepareTrainingData = (trainingData: TrainingData[]) => {
+    if (trainingData.length === 0) return null;
+    
+    const maxLength = 20;
+    const inputs: number[][] = [];
+    const outputs: number[][] = [];
+    
+    trainingData.forEach(item => {
+      const inputTokens = tokenizeText(item.originalText, maxLength);
+      const outputTokens = tokenizeText(item.correctedText, maxLength);
+      
+      inputs.push(inputTokens);
+      outputs.push(outputTokens);
+    });
+    
+    // TensorFlow形式に変換
+    const inputTensor = tf.tensor2d(inputs, [inputs.length, maxLength]);
+    const outputTensor = tf.tensor2d(outputs, [outputs.length, maxLength]);
+    
+    return {
+      inputs: inputTensor,
+      outputs: outputTensor
+    };
+  };
+
+  // 実際のモデル学習関数
+  const startTraining = async () => {
+    if (!model || trainingData.length === 0) {
+      alert('学習データがないか、モデルが読み込まれていません');
+      return;
+    }
+    
+    setIsTraining(true);
+    setTrainProgress(0);
+    
+    try {
+      // 学習データの準備
+      const trainData = prepareTrainingData(trainingData);
+      if (!trainData) {
+        throw new Error('学習データの準備に失敗しました');
+      }
+      
+      // 学習の実行
+      await model.fit(trainData.inputs, trainData.outputs, {
+        epochs: 10,
+        batchSize: Math.max(1, Math.floor(trainingData.length / 4)),
+        callbacks: {
+          onEpochEnd: (epoch, logs) => {
+            const progress = Math.round(((epoch + 1) / 10) * 100);
+            setTrainProgress(progress);
+            console.log(`エポック ${epoch + 1}/10, 損失: ${logs?.loss}, 精度: ${logs?.acc}`);
+          }
+        }
+      });
+      
+      // モデルの保存
+      await model.save('indexeddb://ocr-correction-model');
+      
+      alert('テキスト修正データの学習が完了しました！\n今後のOCR処理に反映されます。');
+    } catch (error) {
+      console.error('学習中にエラーが発生しました:', error);
+      alert(error instanceof Error ? error.message : '学習中にエラーが発生しました。');
+    } finally {
+      setIsTraining(false);
+      setTrainProgress(100);
+      
+      // 解放
+      try {
+        if (trainData) {
+          trainData.inputs.dispose();
+          trainData.outputs.dispose();
+        }
+      } catch (disposeError) {
+        console.error('リソース解放中にエラーが発生しました:', disposeError);
+      }
+    }
+  };
+
+  // モデルを使用してテキストを修正する関数
+  const correctText = async (text: string): Promise<string> => {
+    if (!model || !modelLoaded) return text;
+    
+    // 既知の修正パターンを確認
+    const exactMatch = trainingData.find(item => item.originalText === text);
+    if (exactMatch) {
+      return exactMatch.correctedText;
+    }
+    
+    try {
+      // トークン化
+      const tokens = tokenizeText(text);
+      const inputTensor = tf.tensor2d([tokens], [1, tokens.length]);
+      
+      // 予測
+      const prediction = model.predict(inputTensor) as tf.Tensor;
+      const predictionData = await prediction.array() as number[][];
+      
+      // 予測結果を取得
+      const predictedTokens = predictionData[0].map((prob, i) => {
+        // 確率が十分高い場合のみトークンを置き換える
+        return prob > 0.7 ? i : tokens[i % tokens.length];
+      });
+      
+      // テキストに戻す
+      const correctedText = detokenizeText(predictedTokens);
+      
+      // リソース解放
+      inputTensor.dispose();
+      prediction.dispose();
+      
+      return correctedText;
+    } catch (error) {
+      console.error('テキスト修正中にエラーが発生しました:', error);
+      return text; // エラーの場合は元のテキストを返す
+    }
+  };
 
   // 画像前処理関数
   const preprocessImage = async (imageFile: File): Promise<File> => {
@@ -532,13 +759,28 @@ export function OCRForm() {
           // OCR処理
           const result = await recognizeWithTesseract(processedRegionFile);
           
-          // バウンディングボックス情報を更新
-          result.lines = result.lines.map(line => ({
-            ...line,
-            imageSrc: region.imageSrc
-          }));
+          // 学習したモデルでテキスト修正（ロードされている場合）
+          const lines = await Promise.all(
+            result.lines.map(async line => {
+              if (modelLoaded) {
+                const correctedText = await correctText(line.text);
+                return {
+                  ...line,
+                  text: correctedText,
+                  imageSrc: region.imageSrc
+                };
+              }
+              return {
+                ...line,
+                imageSrc: region.imageSrc
+              };
+            })
+          );
           
-          return result;
+          return {
+            ...result,
+            lines
+          };
         })
       );
       
@@ -624,6 +866,77 @@ export function OCRForm() {
     }
   };
 
+  // テキスト編集の開始
+  const startEditing = (index: number) => {
+    if (!ocrResult) return;
+    
+    // 現在の編集状態を更新
+    setIsEditing(prev => ({ ...prev, [index]: true }));
+    
+    // 初期テキストを設定
+    setEditedText(prev => ({ 
+      ...prev, 
+      [index]: ocrResult.lines[index].text 
+    }));
+  };
+  
+  // テキスト編集の終了と学習データへの追加
+  const saveEdit = (index: number) => {
+    if (!ocrResult) return;
+    
+    const originalText = ocrResult.lines[index].text;
+    const correctedText = editedText[index];
+    
+    // 修正がない場合は学習データに追加しない
+    if (originalText === correctedText || !correctedText) {
+      setIsEditing(prev => ({ ...prev, [index]: false }));
+      return;
+    }
+    
+    // 修正済みテキストを反映
+    const updatedLines = [...ocrResult.lines];
+    updatedLines[index] = {
+      ...updatedLines[index],
+      text: correctedText
+    };
+    
+    // OCR結果を更新
+    setOcrResult({
+      ...ocrResult,
+      lines: updatedLines,
+      text: updatedLines.map(line => line.text).join('\n')
+    });
+    
+    // 学習データに追加
+    const newTrainingData: TrainingData = {
+      imageSrc: ocrResult.lines[index].imageSrc || '',
+      originalText,
+      correctedText,
+      bbox: ocrResult.lines[index].bbox
+    };
+    
+    const updatedTrainingData = [...trainingData, newTrainingData];
+    setTrainingData(updatedTrainingData);
+    
+    // localStorageに学習データを保存
+    localStorage.setItem('ocrTrainingData', JSON.stringify(updatedTrainingData));
+    
+    // 編集モードを終了
+    setIsEditing(prev => ({ ...prev, [index]: false }));
+    
+    console.log(`テキスト修正が保存されました: "${originalText}" → "${correctedText}"`);
+  };
+  
+  // テキスト編集の取り消し
+  const cancelEditing = (index: number) => {
+    setIsEditing(prev => ({ ...prev, [index]: false }));
+  };
+  
+  // テキスト入力の変更を処理
+  const handleTextChange = (index: number, value: string) => {
+    setEditedText(prev => ({ ...prev, [index]: value }));
+  };
+
   return (
     <div className="flex flex-col space-y-6 w-full">
       {/* 画像アップロードエリア */}
@@ -659,6 +972,23 @@ export function OCRForm() {
           {isHandwrittenMode ? '手書きモード (ON)' : '手書きモード (OFF)'}
         </Button>
       </div>
+
+      {/* 学習データ情報 */}
+      {trainingData.length > 0 && (
+        <div className="flex justify-between items-center p-4 border rounded-lg bg-gray-50">
+          <div>
+            <h2 className="font-medium text-gray-700">学習データ: {trainingData.length}件</h2>
+            <p className="text-sm text-gray-500">認識精度向上のために修正したテキストで学習できます</p>
+          </div>
+          <Button
+            onClick={startTraining}
+            disabled={isTraining}
+            className="bg-green-600 text-white hover:bg-green-700"
+          >
+            {isTraining ? `学習中... ${trainProgress}%` : '学習を開始'}
+          </Button>
+        </div>
+      )}
 
       {/* 画像プレビューとOCR結果 */}
       {(originalImagePreview || isProcessing) && (
@@ -740,17 +1070,52 @@ export function OCRForm() {
                           </div>
                         )}
                         
-                        {/* OCR結果テキスト */}
+                        {/* OCR結果テキスト - 編集可能に修正 */}
                         <div className="relative bg-white p-4">
-                          <p className="break-words pr-14 text-lg font-medium">{line.text}</p>
-                          <button
-                            onClick={() => handleCopyText(line.text, index)}
-                            className={`absolute right-2 top-2 p-1.5 rounded ${
-                              copiedIndex === index ? 'bg-green-500 text-white' : 'bg-gray-200 text-gray-700 group-hover:bg-gray-300'
-                            } transition-colors`}
-                          >
-                            {copiedIndex === index ? 'コピー済' : 'コピー'}
-                          </button>
+                          {isEditing[index] ? (
+                            <div className="flex flex-col space-y-2">
+                              <textarea
+                                value={editedText[index] || ''}
+                                onChange={(e) => handleTextChange(index, e.target.value)}
+                                className="w-full p-2 border border-gray-300 rounded text-lg"
+                                rows={2}
+                              />
+                              <div className="flex justify-end space-x-2">
+                                <button
+                                  onClick={() => cancelEditing(index)}
+                                  className="px-3 py-1 bg-gray-200 text-gray-700 rounded"
+                                >
+                                  キャンセル
+                                </button>
+                                <button
+                                  onClick={() => saveEdit(index)}
+                                  className="px-3 py-1 bg-green-600 text-white rounded"
+                                >
+                                  保存して学習
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="relative">
+                              <p className="break-words pr-14 text-lg font-medium">{line.text}</p>
+                              <div className="absolute right-2 top-0 flex space-x-1">
+                                <button
+                                  onClick={() => handleCopyText(line.text, index)}
+                                  className={`p-1.5 rounded ${
+                                    copiedIndex === index ? 'bg-green-500 text-white' : 'bg-gray-200 text-gray-700 group-hover:bg-gray-300'
+                                  } transition-colors`}
+                                >
+                                  {copiedIndex === index ? 'コピー済' : 'コピー'}
+                                </button>
+                                <button
+                                  onClick={() => startEditing(index)}
+                                  className="p-1.5 rounded bg-blue-600 text-white"
+                                >
+                                  修正
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -783,6 +1148,22 @@ export function OCRForm() {
       {/* 非表示のキャンバス要素 */}
       <canvas ref={canvasRef} className="hidden"></canvas>
       <img ref={imageRef} src={imagePreview || ''} className="hidden" alt="Processed" />
+
+      {/* 学習進捗のモーダル */}
+      {isTraining && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white p-6 rounded-lg shadow-lg max-w-md w-full">
+            <h2 className="text-xl font-semibold mb-4">学習中...</h2>
+            <div className="w-full bg-gray-200 rounded-full h-4 mb-4">
+              <div 
+                className="bg-blue-600 h-4 rounded-full transition-all duration-300"
+                style={{ width: `${trainProgress}%` }}
+              ></div>
+            </div>
+            <p className="text-gray-600 text-center">{trainProgress}% 完了</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
